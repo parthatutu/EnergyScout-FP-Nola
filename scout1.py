@@ -14,27 +14,31 @@ INFLUX_TOKEN = "qsGKuJsL9po_6rsu8VpoLmspiyWfcvQRK2oCpu2Vht6je5_aYJMk16YKAci0cQB2
 INFLUX_ORG = "Atutu"
 INFLUX_BUCKET = "power-monitoring"
 
+# --- LOCAL LOG FILE ---
+LOG_FILE = "/home/pi/Desktop/data.txt"
+
 # Initialize InfluxDB Client
 influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
 # --- MODBUS CONFIGURATION ---
-MODBUS_PORT  = '/dev/ttyAMA0'
-GPS_PORT     = '/dev/ttyAMA2'
-BAUD_MODBUS  = 9600
-BAUD_GPS     = 9600
-GPS_INTERVAL = 1800  # 30 minutes
+MODBUS_PORT   = '/dev/ttyAMA0'
+GPS_PORT      = '/dev/ttyAMA2'
+BAUD_MODBUS   = 9600
+BAUD_GPS      = 9600
+GPS_INTERVAL  = 1800  # 30 minutes
+POLL_INTERVAL = 60    # 60 seconds per cycle
 
-# --- JSY-MK-231 DC METER REGISTER MAP (FC03, unsigned long, value / 10000) ---
-# 0x0100 (256) = Voltage (V)
-# 0x0102 (258) = Current (A)
-# 0x0104 (260) = Active Power (W)
-
-# --- SDM120 AC METER REGISTER MAP (FC04, float) ---
-# 0  (0x0000) = Voltage (V)
-# 6  (0x0006) = Current (A)
-# 12 (0x000C) = Active Power (W)
-# 30 (0x001E) = Power Factor
+# --- LOCAL LOGGER ---
+def log(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] {message}"
+    print(entry)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(entry + "\n")
+    except Exception as e:
+        print(f"[LOG ERROR] Could not write to {LOG_FILE}: {e}")
 
 # --- INSTRUMENT SETUP ---
 def setup_modbus(slave_id):
@@ -48,7 +52,8 @@ def setup_modbus(slave_id):
             delay_before_tx=0.001, delay_before_rx=0.001
         )
         return ins
-    except:
+    except Exception as e:
+        log(f"[SETUP ERROR] Slave {slave_id}: {e}")
         return None
 
 meters = [
@@ -70,7 +75,7 @@ def parse_nmea_to_decimal(value, direction):
     return round(decimal, 6)
 
 def get_gps_location():
-    print(f"\n[GPS] [{SCOUT_ID}] Attempting location from {GPS_PORT}...")
+    log(f"[GPS] Attempting location from {GPS_PORT}...")
     try:
         with serial.Serial(GPS_PORT, BAUD_GPS, timeout=2) as ser:
             start_search = time.time()
@@ -81,33 +86,31 @@ def get_gps_location():
                     if len(parts) > 6 and parts[2] == 'A':
                         lat = parse_nmea_to_decimal(parts[3], parts[4])
                         lon = parse_nmea_to_decimal(parts[5], parts[6])
-                        print(f">>> GPS: LAT: {lat}, LON: {lon}")
+                        log(f"[GPS] FIX: LAT={lat}, LON={lon}")
                         return lat, lon
                     elif len(parts) > 2 and parts[2] == 'V':
-                        print(">>> GPS: NO FIX")
+                        log("[GPS] NO FIX")
                         return None, None
-            print(">>> GPS: TIMEOUT")
+            log("[GPS] TIMEOUT")
             return None, None
     except Exception as e:
-        print(f">>> GPS: ERROR - {e} (continuing without GPS)")
+        log(f"[GPS ERROR] {e}")
         return None, None
 
 # --- INFLUXDB WRITERS ---
 def send_gps_to_influxdb(latitude, longitude):
-    """Write GPS as its own measurement so it's easy to query separately in InfluxDB."""
     try:
         point = Point("gps_location") \
             .tag("scout", SCOUT_ID) \
             .field("latitude",  latitude) \
             .field("longitude", longitude)
         write_api.write(bucket=INFLUX_BUCKET, record=point)
-        print(f"✓ [{SCOUT_ID}] GPS sent to InfluxDB: LAT={latitude}, LON={longitude}")
+        log(f"[INFLUX] GPS sent: LAT={latitude}, LON={longitude}")
     except Exception as e:
-        print(f"✗ [{SCOUT_ID}] GPS InfluxDB Error: {e} (continuing)")
+        log(f"[INFLUX ERROR] GPS: {e}")
 
 def send_to_influxdb(meter_name, meter_type, voltage=None, current=None, power=None,
                      power_factor=None, latitude=None, longitude=None):
-    """Write meter readings to InfluxDB. GPS coordinates attached to each point."""
     try:
         point = Point("power_meter") \
             .tag("scout", SCOUT_ID) \
@@ -119,7 +122,6 @@ def send_to_influxdb(meter_name, meter_type, voltage=None, current=None, power=N
         if power        is not None: point.field("power",        power)
         if power_factor is not None: point.field("power_factor", power_factor)
 
-        # Attach last-known GPS coords to every meter point
         if latitude is not None and longitude is not None:
             point.field("latitude",  latitude)
             point.field("longitude", longitude)
@@ -131,89 +133,83 @@ def send_to_influxdb(meter_name, meter_type, voltage=None, current=None, power=N
         if current      is not None: fields.append(f"{current:.4f}A")
         if power        is not None: fields.append(f"{power:.2f}W")
         if power_factor is not None: fields.append(f"PF={power_factor:.3f}")
-        print(f"✓ [{SCOUT_ID}] Data sent: {meter_name} = {' | '.join(fields)}")
+        log(f"[INFLUX] {meter_name} = {' | '.join(fields)}")
     except Exception as e:
-        print(f"✗ [{SCOUT_ID}] InfluxDB Error: {e} (continuing)")
+        log(f"[INFLUX ERROR] {meter_name}: {e}")
 
 # --- MAIN EXECUTION ---
 last_gps_time = 0
 current_lat   = None
 current_lon   = None
 
-print(f"[{SCOUT_ID}] System Started. Polling SDM120 and DC Meters...")
-print(f"[{SCOUT_ID}] Sending data to InfluxDB Cloud at: {INFLUX_URL}")
-print(f"[{SCOUT_ID}] NOTE: System will continue running even if GPS or individual meters fail")
+log(f"[{SCOUT_ID}] System Started. Polling all meters every {POLL_INTERVAL}s...")
+log(f"[{SCOUT_ID}] Sending data to InfluxDB Cloud at: {INFLUX_URL}")
+log(f"[{SCOUT_ID}] Logging to: {LOG_FILE}")
 
-try:
-    while True:
+while True:
+    try:
         current_time = time.time()
+        cycle_start  = time.time()
+
+        log(f"[{SCOUT_ID}] --- NEW CYCLE ---")
 
         # 1. GPS UPDATE (Every 30 Minutes)
         if current_time - last_gps_time >= GPS_INTERVAL:
             try:
                 current_lat, current_lon = get_gps_location()
-                # Write GPS as its own dedicated measurement in InfluxDB
                 if current_lat is not None and current_lon is not None:
                     send_gps_to_influxdb(current_lat, current_lon)
             except Exception as e:
-                print(f">>> GPS: Unexpected error - {e} (continuing without GPS)")
+                log(f"[GPS ERROR] Unexpected: {e}")
                 current_lat, current_lon = None, None
             last_gps_time = current_time
 
-        # 2. METER POLLING (5 Seconds per meter)
+        # 2. METER POLLING (one read per meter per cycle)
         for m in meters:
             if m["obj"] is None:
-                print(f"\n--- Skipping {m['name']} (Slave {m['id']}) - Not initialized ---")
+                log(f"[SKIP] {m['name']} (Slave {m['id']}) - Not initialized")
                 continue
 
-            print(f"\n--- {m['name']} (Slave {m['id']}) ---")
-            meter_start      = time.time()
-            successful_reads = 0
+            log(f"[READING] {m['name']} (Slave {m['id']})")
+            try:
+                if m["type"] == "sdm120":
+                    v  = m["obj"].read_float(0,  functioncode=4)
+                    a  = m["obj"].read_float(6,  functioncode=4)
+                    p  = m["obj"].read_float(12, functioncode=4)
+                    pf = m["obj"].read_float(30, functioncode=4)
+                    log(f"[AC] {m['name']} -> {v:.1f}V | {a:.4f}A | {p:.2f}W | PF={pf:.3f}")
+                    send_to_influxdb(m['name'], m['type'],
+                                     voltage=v, current=a, power=p, power_factor=pf,
+                                     latitude=current_lat, longitude=current_lon)
+                else:
+                    raw_v = m["obj"].read_long(256, functioncode=3)
+                    raw_a = m["obj"].read_long(258, functioncode=3)
+                    raw_p = m["obj"].read_long(260, functioncode=3)
+                    v = raw_v / 10000.0
+                    a = raw_a / 10000.0
+                    p = raw_p / 10000.0
+                    log(f"[DC] {m['name']} -> {v:.2f}V | {a:.4f}A | {p:.2f}W")
+                    send_to_influxdb(m['name'], m['type'],
+                                     voltage=v, current=a, power=p,
+                                     latitude=current_lat, longitude=current_lon)
+            except Exception as e:
+                log(f"[METER ERROR] {m['name']}: {e}")
 
-            while time.time() - meter_start < 5:
-                try:
-                    if m["type"] == "sdm120":
-                        # --- SDM120 AC METER (FC04, float) ---
-                        v  = m["obj"].read_float(0,  functioncode=4)  # Voltage (V)
-                        a  = m["obj"].read_float(6,  functioncode=4)  # Current (A)
-                        p  = m["obj"].read_float(12, functioncode=4)  # Active Power (W)
-                        pf = m["obj"].read_float(30, functioncode=4)  # Power Factor (0x001E)
-                        print(f"AC -> {v:.1f}V | {a:.2f}A | {p:.1f}W | PF={pf:.3f}")
-                        send_to_influxdb(m['name'], m['type'],
-                                         voltage=v, current=a, power=p, power_factor=pf,
-                                         latitude=current_lat, longitude=current_lon)
-                        successful_reads += 1
+        # 3. SLEEP for remainder of 60-second cycle
+        elapsed    = time.time() - cycle_start
+        sleep_time = max(0, POLL_INTERVAL - elapsed)
+        log(f"[{SCOUT_ID}] Cycle complete. Sleeping {sleep_time:.1f}s...")
+        time.sleep(sleep_time)
 
-                    else:
-                        # --- JSY-MK-231 DC METER (FC03, 4-byte unsigned long, /10000) ---
-                        raw_v = m["obj"].read_long(256, functioncode=3)  # 0x0100 Voltage
-                        raw_a = m["obj"].read_long(258, functioncode=3)  # 0x0102 Current
-                        raw_p = m["obj"].read_long(260, functioncode=3)  # 0x0104 Active Power
-                        v = raw_v / 10000.0
-                        a = raw_a / 10000.0
-                        p = raw_p / 10000.0
-                        print(f"DC -> {v:.2f}V | {a:.4f}A | {p:.2f}W")
-                        send_to_influxdb(m['name'], m['type'],
-                                         voltage=v, current=a, power=p,
-                                         latitude=current_lat, longitude=current_lon)
-                        successful_reads += 1
+    except KeyboardInterrupt:
+        log(f"[{SCOUT_ID}] Shutting down gracefully...")
+        try:
+            influx_client.close()
+        except:
+            pass
+        log(f"[{SCOUT_ID}] InfluxDB connection closed. Goodbye!")
+        break
 
-                except Exception as e:
-                    print(f"{m['name']} Error: {e} (continuing)")
-
-                time.sleep(1)
-
-            if successful_reads == 0:
-                print(f"{m['name']}: No successful reads in this cycle (will retry next cycle)")
-
-except KeyboardInterrupt:
-    print(f"\n[{SCOUT_ID}] Shutting down gracefully...")
-    influx_client.close()
-    print(f"[{SCOUT_ID}] InfluxDB connection closed. Goodbye!")
-except Exception as e:
-    print(f"\n[{SCOUT_ID}] Unexpected error in main loop: {e}")
-    try:
-        influx_client.close()
-    except:
-        pass
-    print(f"[{SCOUT_ID}] System stopped.")
+    except Exception as e:
+        log(f"[{SCOUT_ID}] Fatal error: {e} — restarting in 10s...")
+        time.sleep(10)
