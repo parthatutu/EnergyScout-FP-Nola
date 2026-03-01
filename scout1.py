@@ -15,7 +15,7 @@ INFLUX_ORG = "Atutu"
 INFLUX_BUCKET = "power-monitoring"
 
 # --- LOCAL LOG FILE ---
-LOG_FILE = "/home/pi/Desktop/data.txt"
+LOG_FILE = "/home/scout1/Desktop/data.txt"
 
 # Initialize InfluxDB Client
 influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
